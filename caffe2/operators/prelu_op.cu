@@ -150,11 +150,11 @@ template <>
 bool PReluOp<float, CUDAContext>::RunOnDevice() {
   const auto& X = Input(0);
   const auto& W = Input(1);
-  auto* Y = Output(0);
-  Y->ResizeLike(X);
+
+  auto* Y = Output(0, X.sizes(), at::dtype<float>());
   const auto* Xdata = X.data<float>();
   const auto* Wdata = W.data<float>();
-  auto* Ydata = Y->mutable_data<float>();
+  auto* Ydata = Y->template mutable_data<float>();
 
   const auto C = order_ == StorageOrder::NCHW ? X.dim(1) : X.dim(X.ndim() - 1);
   const auto C_shared = (W.size() == 1);
@@ -207,12 +207,10 @@ bool PReluGradientOp<float, CUDAContext>::RunOnDevice() {
   auto& W = Input(3);
 
   CAFFE_ENFORCE(&Y != &X, "Cannot backpropagate through an in-place PReLU");
-  auto* dX = Output(0);
-  auto* dW = Output(1);
 
   DCHECK_EQ(dY.size(), Y.size());
-  dX->ResizeLike(Y);
-  dW->ResizeLike(W);
+  auto* dX = Output(0, Y.sizes(), at::dtype<float>());
+  auto* dW = Output(1, W.sizes(), at::dtype<float>());
 
   const auto C = order_ == StorageOrder::NCHW ? X.dim(1) : X.dim(X.ndim() - 1);
   const auto C_shared = (W.size() == 1);
@@ -221,8 +219,8 @@ bool PReluGradientOp<float, CUDAContext>::RunOnDevice() {
   const float* dYdata = dY.data<float>();
   const float* Xdata = X.data<float>();
   const float* Wdata = W.data<float>();
-  float* dXdata = dX->mutable_data<float>();
-  float* dWdata = dW->mutable_data<float>();
+  float* dXdata = dX->template mutable_data<float>();
+  float* dWdata = dW->template mutable_data<float>();
   int N = Y.dim(0);
 
   if (C_shared) {

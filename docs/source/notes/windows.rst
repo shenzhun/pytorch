@@ -19,9 +19,9 @@ MKL and MAGMA. Here are the steps to build with them.
     7z x -aoa mkl_2018.2.185.7z -omkl
 
     REM Download MAGMA files
-    REM cuda90/cuda91 is also available in the following line.
-    set CUDA_PREFIX=cuda80 
-    curl -k https://s3.amazonaws.com/ossci-windows/magma_%CUDA_PREFIX%_release_mkl_2018.2.185.7z -o magma.7z
+    REM cuda90/cuda92/cuda100 is also available in the following line.
+    set CUDA_PREFIX=cuda80
+    curl -k https://s3.amazonaws.com/ossci-windows/magma_2.4.0_%CUDA_PREFIX%_release.7z -o magma.7z
     7z x -aoa magma.7z -omagma
     
     REM Setting essential environment variables
@@ -48,8 +48,8 @@ build tasks. It can be used by typing only a few lines of code.
 One key install script
 ^^^^^^^^^^^^^^^^^^^^^^
 
-You can take a look at the script `here
-<https://github.com/peterjc123/pytorch-scripts>`_. 
+You can take a look at `this set of scripts
+<https://github.com/peterjc123/pytorch-scripts>`_.
 It will lead the way for you.
 
 Extension
@@ -176,8 +176,8 @@ You can resolve this by typing the following command.
 
 As for the wheels package, since we didn't pack some libaries and VS2017 
 redistributable files in, please make sure you install them manually.
-The VS 2017 redistributable installer can be downloaded `here
-<https://aka.ms/vs/15/release/VC_redist.x64.exe>`_.
+The `VS 2017 redistributable installer
+<https://aka.ms/vs/15/release/VC_redist.x64.exe>`_ can be downloaded.
 And you should also pay attention to your installation of Numpy. Make sure it
 uses MKL instead of OpenBLAS. You may type in the following command.
 

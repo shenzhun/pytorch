@@ -12,13 +12,14 @@ from model_defs.srresnet import SRResNet
 from model_defs.dcgan import _netD, _netG, weights_init, bsz, imgsz, nz
 from model_defs.op_test import DummyNet, ConcatNet, PermuteNet, PReluNet
 
-from test_pytorch_common import TestCase, run_tests, skipIfNoLapack, skipIfCI
+from test_pytorch_common import TestCase, run_tests, skipIfNoLapack
 
 import torch
 import torch.onnx
 import torch.onnx.utils
 from torch.autograd import Variable, Function
 from torch.nn import Module
+from torch.onnx import OperatorExportTypes
 
 import onnx
 import onnx.checker
@@ -45,7 +46,7 @@ BATCH_SIZE = 2
 
 class TestModels(TestCase):
     def exportTest(self, model, inputs, rtol=1e-2, atol=1e-7):
-        trace = torch.onnx.utils._trace(model, inputs)
+        trace = torch.onnx.utils._trace(model, inputs, OperatorExportTypes.ONNX)
         torch._C._jit_pass_lint(trace.graph())
         verify(model, inputs, backend, rtol=rtol, atol=atol)
 
@@ -76,7 +77,6 @@ class TestModels(TestCase):
         x = Variable(torch.randn(1, 3, 224, 224).fill_(1.0))
         self.exportTest(toC(SRResNet(rescale_factor=4, n_filters=64, n_blocks=8)), toC(x))
 
-    @skipIfCI
     @skipIfNoLapack
     def test_super_resolution(self):
         x = Variable(
@@ -95,25 +95,21 @@ class TestModels(TestCase):
         x = Variable(torch.randn(BATCH_SIZE, 1, 28, 28).fill_(1.0))
         self.exportTest(toC(MNIST()), toC(x))
 
-    @skipIfCI
     def test_vgg16(self):
         # VGG 16-layer model (configuration "D")
         x = Variable(torch.randn(BATCH_SIZE, 3, 224, 224).fill_(1.0))
         self.exportTest(toC(vgg16()), toC(x))
 
-    @skipIfCI
     def test_vgg16_bn(self):
         # VGG 16-layer model (configuration "D") with batch normalization
         x = Variable(torch.randn(BATCH_SIZE, 3, 224, 224).fill_(1.0))
         self.exportTest(toC(vgg16_bn()), toC(x))
 
-    @skipIfCI
     def test_vgg19(self):
         # VGG 19-layer model (configuration "E")
         x = Variable(torch.randn(BATCH_SIZE, 3, 224, 224).fill_(1.0))
         self.exportTest(toC(vgg19()), toC(x))
 
-    @skipIfCI
     def test_vgg19_bn(self):
         # VGG 19-layer model (configuration 'E') with batch normalization
         x = Variable(torch.randn(BATCH_SIZE, 3, 224, 224).fill_(1.0))
@@ -126,7 +122,7 @@ class TestModels(TestCase):
 
     def test_inception(self):
         x = Variable(
-            torch.randn(BATCH_SIZE, 3, 299, 299).fill_(1.0))
+            torch.randn(BATCH_SIZE, 3, 299, 299) + 1.)
         self.exportTest(toC(inception_v3()), toC(x))
 
     def test_squeezenet(self):

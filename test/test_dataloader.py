@@ -5,34 +5,51 @@ import os
 import ctypes
 import signal
 import torch
+import gc
 import time
 import traceback
 import unittest
 import subprocess
-from torch import multiprocessing
-from torch.utils.data import Dataset, TensorDataset, DataLoader, ConcatDataset
+import itertools
+import warnings
+from torch import multiprocessing as mp
+from torch.utils.data import _utils, Dataset, TensorDataset, DataLoader, ConcatDataset
+from torch.utils.data._utils import ExceptionWrapper, MP_STATUS_CHECK_INTERVAL
 from torch.utils.data.dataset import random_split
-from torch.utils.data.dataloader import default_collate, ExceptionWrapper, MANAGER_STATUS_CHECK_INTERVAL
-from common import TestCase, run_tests, TEST_NUMPY, IS_WINDOWS
+from common_utils import (TestCase, run_tests, TEST_NUMPY, IS_WINDOWS, IS_PPC,
+                          IS_PYTORCH_CI, NO_MULTIPROCESSING_SPAWN, skipIfRocm,
+                          load_tests)
 
-# We cannot import TEST_CUDA from common_nn here, because if we do that,
-# the TEST_CUDNN line from common_nn will be executed multiple times
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
+    err_msg = ("psutil not found. Some critical data loader tests relying on it "
+               "(e.g., TestDataLoader.test_proper_exit) will not run.")
+    if IS_PYTORCH_CI:
+        raise ImportError(err_msg)
+    else:
+        warnings.warn(err_msg)
+
+
+# load_tests from common_utils is used to automatically filter tests for
+# sharding on sandcastle. This line silences flake warnings
+load_tests = load_tests
+
+# We cannot import TEST_CUDA from common_cuda here, because if we do that,
+# the TEST_CUDNN line from common_cuda will be executed multiple times
 # as well during the execution of this test suite, and it will cause
 # CUDA OOM error on Windows.
 TEST_CUDA = torch.cuda.is_available()
 
-# We need spawn start method for test_manager_unclean_exit, but
-# Python 2.7 doesn't allow it.
-if sys.version_info[0] == 3:
-    # Without the try-catch block, some tests will complain that
-    # context has already been set.
-    try:
-        multiprocessing.set_start_method('spawn')
-    except RuntimeError:
-        pass
+if not NO_MULTIPROCESSING_SPAWN:
+    # Get a multiprocessing context because some test / third party library will
+    # set start_method when imported, and setting again triggers RuntimeError.
+    mp = mp.get_context(method='spawn')
 
 
-JOIN_TIMEOUT = 17.0 if IS_WINDOWS else 6.5
+JOIN_TIMEOUT = 17.0 if (IS_WINDOWS or IS_PPC) else 11.0
 
 
 class TestDatasetRandomSplit(TestCase):
@@ -144,23 +161,20 @@ class TestConcatDataset(TestCase):
 
 # Stores the first encountered exception in .exception.
 # Inspired by https://stackoverflow.com/a/33599967
-class ErrorTrackingProcess(multiprocessing.Process):
+class ErrorTrackingProcess(mp.Process):
 
     def __init__(self, *args, **kwargs):
         super(ErrorTrackingProcess, self).__init__(*args, **kwargs)
-        self._pconn, self._cconn = multiprocessing.Pipe()
+        self._pconn, self._cconn = mp.Pipe()
         self._exception = None
 
     def run(self):
-        # Disable stderr printing from os level, and make workers not printing
-        # to stderr.
-        # Can't use sys.stderr.close, otherwise Python `raise` will error with
-        # ValueError: I/O operation on closed file.
-        os.close(sys.stderr.fileno())
+        # Disable polluting stderr with errors that are supposed to happen.
+        sys.stderr = open(os.devnull, "w")
         try:
             super(ErrorTrackingProcess, self).run()
             self._cconn.send(None)
-        except Exception as e:
+        except Exception:
             self._cconn.send(ExceptionWrapper(sys.exc_info()))
             raise
 
@@ -208,9 +222,12 @@ class SleepDataset(Dataset):
     def __init__(self, size, sleep_sec):
         self.size = size
         self.sleep_sec = sleep_sec
+        self.sleeped = False
 
     def __getitem__(self, idx):
-        time.sleep(self.sleep_sec)
+        if not self.sleeped:
+            time.sleep(self.sleep_sec)
+            self.sleeped = True
         return idx
 
     def __len__(self):
@@ -235,8 +252,8 @@ class SynchronizedSeedDataset(Dataset):
 
     def __init__(self, size, num_workers):
         assert size >= num_workers
-        self.count = multiprocessing.Value('i', 0, lock=True)
-        self.barrier = multiprocessing.Semaphore(0)
+        self.count = mp.Value('i', 0, lock=True)
+        self.barrier = mp.Semaphore(0)
         self.num_workers = num_workers
         self.size = size
 
@@ -254,15 +271,113 @@ class SynchronizedSeedDataset(Dataset):
 
 
 def _test_timeout():
-    dataset = SleepDataset(10, 10)
+    dataset = SleepDataset(10, 3)
     dataloader = DataLoader(dataset, batch_size=2, num_workers=2, timeout=1)
     _ = next(iter(dataloader))
 
 
+def _test_timeout_pin_memory():
+    dataset = SleepDataset(10, 3)
+    dataloader = DataLoader(dataset, batch_size=2, num_workers=2, timeout=1, pin_memory=True)
+    _ = next(iter(dataloader))
+
+
+def disable_stderr(worker_id):
+    r"""
+    Avoids printing "ERROR: Unexpected segmentation fault encountered in worker."
+    from workers. Since worker signal handler prints with low-level write(),
+    this has to be done on OS level via dup.
+
+    This is used as worker_init_fn for test_segfault.
+    """
+    sys.stderr.flush()  # flush library buffers that dup2 knows nothing about
+    # Can't use a with-block because otherwise the fd will be closed when this
+    # function ends.
+    devnull = open(os.devnull, 'w')
+    os.dup2(devnull.fileno(), sys.stderr.fileno())
+
+
 def _test_segfault():
     dataset = SegfaultDataset(10)
-    dataloader = DataLoader(dataset, batch_size=2, num_workers=2)
+    dataloader = DataLoader(dataset, batch_size=2, num_workers=2, worker_init_fn=disable_stderr)
     _ = next(iter(dataloader))
+
+
+class TestProperExitDataset(object):
+    def __init__(self, size, error_event):
+        self.size = size
+        self.error_event = error_event
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        if self.error_event is not None and self.error_event.is_set():
+            raise RuntimeError('Worker error')
+        return torch.tensor([idx])
+
+
+# See TestDataLoader.test_proper_exit for usage
+def _test_proper_exit(use_workers, pin_memory, exit_method, hold_iter_reference,
+                      loader_setup_event, tester_setup_event):
+    num_workers = 2 if use_workers else 0
+
+    if exit_method == 'worker_error' or exit_method == 'worker_kill':
+        assert use_workers is True
+
+    if exit_method == 'worker_error':
+        worker_error_event = mp.Event()
+    else:
+        worker_error_event = None
+
+    ds = TestProperExitDataset(12, worker_error_event)
+
+    loader = DataLoader(ds, batch_size=1, shuffle=False,
+                        num_workers=num_workers, pin_memory=pin_memory)
+    error_it = 2
+
+    if use_workers:
+        # 2 is the magical per-worker prefetch number...
+        # FIXME: change this after the number becomes configurable.
+        assert len(loader) > (error_it + 2 + 1) * num_workers
+
+    it = iter(loader)
+    if use_workers:
+        workers = it.workers
+
+    def kill_pid(pid):
+        psutil_p = psutil.Process(pid)
+        psutil_p.kill()
+        psutil_p.wait(JOIN_TIMEOUT)
+        assert not psutil_p.is_running()
+
+    for i, _ in enumerate(it):
+        if i == 0:
+            if not hold_iter_reference:
+                del it
+            loader_setup_event.set()
+            tester_setup_event.wait()
+            # ensure that the workers are still alive
+            if use_workers:
+                for w in workers:
+                    assert w.is_alive()
+            if worker_error_event is not None:
+                worker_error_event.set()
+
+        if i == error_it:
+            if exit_method == 'loader_error':
+                raise RuntimeError('Loader error')
+            elif exit_method == 'loader_kill':
+                kill_pid(os.getpid())
+            elif exit_method == 'worker_kill':
+                kill_pid(workers[0].pid)
+
+    if not hold_iter_reference:
+        # Tries to trigger the __del__ clean-up rather than the automatic
+        # exiting of daemonic children. Technically it should be automatically
+        # triggered, but I don't want to rely on the implementation detail of
+        # Python gc.
+        gc.collect()
 
 
 # test custom init function
@@ -338,13 +453,13 @@ class TestDataLoader(TestCase):
         self.assertEqual(len(dataloader_shuffle), 5)
 
     @unittest.skipIf(not TEST_CUDA, "CUDA unavailable")
+    @skipIfRocm
     def test_sequential_pin_memory(self):
         loader = DataLoader(self.dataset, batch_size=2, pin_memory=True)
         for input, target in loader:
             self.assertTrue(input.is_pinned())
             self.assertTrue(target.is_pinned())
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     def test_multiple_dataloaders(self):
         loader1_it = iter(DataLoader(self.dataset, num_workers=1))
         loader2_it = iter(DataLoader(self.dataset, num_workers=2))
@@ -355,7 +470,6 @@ class TestDataLoader(TestCase):
         next(loader1_it)
         next(loader2_it)
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     @unittest.skip("temporarily disable until flaky failures are fixed")
     def test_segfault(self):
         p = ErrorTrackingProcess(target=_test_segfault)
@@ -373,20 +487,24 @@ class TestDataLoader(TestCase):
         finally:
             p.terminate()
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
+    @skipIfRocm
     def test_timeout(self):
-        p = ErrorTrackingProcess(target=_test_timeout)
-        p.start()
-        p.join(JOIN_TIMEOUT)
-        try:
-            self.assertFalse(p.is_alive())
-            self.assertNotEqual(p.exitcode, 0)
-            self.assertIsInstance(p.exception, RuntimeError)
-            self.assertRegex(str(p.exception), r'DataLoader timed out after \d+ seconds')
-        finally:
-            p.terminate()
+        if TEST_CUDA and not NO_MULTIPROCESSING_SPAWN:
+            targets = (_test_timeout, _test_timeout_pin_memory)
+        else:
+            targets = (_test_timeout,)
+        for target in targets:
+            p = ErrorTrackingProcess(target=target)
+            p.start()
+            p.join(JOIN_TIMEOUT)
+            try:
+                self.assertFalse(p.is_alive())
+                self.assertNotEqual(p.exitcode, 0)
+                self.assertIsInstance(p.exception, RuntimeError)
+                self.assertRegex(str(p.exception), r'DataLoader timed out after \d+ seconds')
+            finally:
+                p.terminate()
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     def test_worker_seed(self):
         num_workers = 6
         dataset = SynchronizedSeedDataset(num_workers, num_workers)
@@ -396,7 +514,6 @@ class TestDataLoader(TestCase):
             seeds.add(batch[0])
         self.assertEqual(len(seeds), num_workers)
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     def test_worker_init_fn(self):
         dataset = SeedDataset(4)
         dataloader = DataLoader(dataset, batch_size=2, num_workers=2,
@@ -411,19 +528,15 @@ class TestDataLoader(TestCase):
     def test_shuffle_batch(self):
         self._test_shuffle(DataLoader(self.dataset, batch_size=2, shuffle=True))
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     def test_sequential_workers(self):
         self._test_sequential(DataLoader(self.dataset, num_workers=4))
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     def test_seqential_batch_workers(self):
         self._test_sequential(DataLoader(self.dataset, batch_size=2, num_workers=4))
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     def test_shuffle_workers(self):
         self._test_shuffle(DataLoader(self.dataset, shuffle=True, num_workers=4))
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     def test_shuffle_batch_workers(self):
         self._test_shuffle(DataLoader(self.dataset, batch_size=2, shuffle=True, num_workers=4))
 
@@ -446,13 +559,87 @@ class TestDataLoader(TestCase):
                 self.assertEqual(len(input), 3)
                 self.assertEqual(input, self.data[offset:offset + 3])
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
+    def test_RandomSampler(self):
+
+        from collections import Counter
+        from torch.utils.data import RandomSampler
+
+        def sample_stat(sampler, num_samples):
+            counts = Counter(sampler)
+            count_repeated = sum(val > 1 for val in counts.values())
+            return (count_repeated, min(counts.keys()), max(counts.keys()))
+
+        # test sample with replacement
+        n = len(self.dataset) + 1  # ensure at least one sample is drawn more than once
+        sampler_with_replacement = RandomSampler(self.dataset, replacement=True, num_samples=n)
+        count_repeated, minval, maxval = sample_stat(sampler_with_replacement, n)
+        self.assertTrue(count_repeated > 0)
+        self.assertTrue(minval >= 0)
+        self.assertTrue(maxval < len(self.dataset))
+
+        # test sample without replacement
+        sampler_without_replacement = RandomSampler(self.dataset)
+        count_repeated, minval, maxval = sample_stat(sampler_without_replacement, len(self.dataset))
+        self.assertTrue(count_repeated == 0)
+        self.assertTrue(minval == 0)
+        self.assertTrue(maxval == len(self.dataset) - 1)
+
+        # raise error when replacement=False and num_samples is not None
+        self.assertRaises(ValueError, lambda: RandomSampler(self.dataset, num_samples=len(self.dataset)))
+
+        self.assertRaises(ValueError, lambda: RandomSampler(self.dataset, num_samples=0))
+
+    def test_random_sampler_len_with_replacement(self):
+        from torch.utils.data import RandomSampler
+        # add 5 extra samples
+        num_samples = len(self.dataset) + 5
+        sampler = RandomSampler(self.dataset,
+                                replacement=True,
+                                num_samples=num_samples)
+        # test len method
+        self.assertEqual(num_samples, len(sampler))
+
+        # test with iteration
+        count_num_samples = sum(1 for _ in sampler)
+        self.assertEqual(num_samples, count_num_samples)
+
+        # test with dataloader, batch_size = 1
+        batch_size = 1
+        count_num_samples_in_data_loader = len(DataLoader(
+            self.dataset, batch_size=batch_size, sampler=sampler))
+        self.assertEqual(num_samples, count_num_samples_in_data_loader)
+
+        # test with dataloader, batch_size = 6
+        batch_size = 6
+        count_num_samples_in_data_loader = len(DataLoader(
+            self.dataset, batch_size=batch_size, sampler=sampler))
+        self.assertEqual(int(math.ceil(float(num_samples) / batch_size)),
+                         count_num_samples_in_data_loader)
+
+    def test_duplicating_data_with_drop_last(self):
+
+        from torch.utils.data.distributed import DistributedSampler
+
+        num_processes = 4
+        num_batches = 9
+        data_set = torch.IntTensor(range(num_batches))
+        scanned_data = torch.IntTensor([])
+        for i in range(num_processes):
+            s = DistributedSampler(data_set, num_processes, i)
+            d_loader = DataLoader(data_set, batch_size=int(num_batches / num_processes), drop_last=True, sampler=s)
+            for k, data in enumerate(d_loader):
+                scanned_data = torch.cat((scanned_data, data), 0)
+
+        self.assertEqual(scanned_data.size(), scanned_data.unique().size())
+
+    @unittest.skipIf(NO_MULTIPROCESSING_SPAWN, "Disabled for environments that \
+                     don't support multiprocessing with spawn start method")
     def test_batch_sampler(self):
         self._test_batch_sampler()
         self._test_batch_sampler(num_workers=4)
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     @unittest.skipIf(not TEST_CUDA, "CUDA unavailable")
+    @skipIfRocm
     def test_shuffle_pin_memory(self):
         loader = DataLoader(self.dataset, batch_size=2, shuffle=True, num_workers=4, pin_memory=True)
         for input, target in loader:
@@ -478,90 +665,130 @@ class TestDataLoader(TestCase):
     def test_error(self):
         self._test_error(DataLoader(ErrorDataset(100), batch_size=2, shuffle=True))
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
+    @unittest.skipIf(NO_MULTIPROCESSING_SPAWN, "Disabled for environments that \
+                     don't support multiprocessing with spawn start method")
     def test_error_workers(self):
         self._test_error(DataLoader(ErrorDataset(41), batch_size=2, shuffle=True, num_workers=4))
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
-    @unittest.skipIf(not TEST_CUDA, "CUDA unavailable")
+    @unittest.skipIf(IS_WINDOWS, "FIXME: stuck test")
     def test_partial_workers(self):
-        "check that workers exit even if the iterator is not exhausted"
-        loader = iter(DataLoader(self.dataset, batch_size=2, num_workers=4, pin_memory=True))
-        workers = loader.workers
-        worker_manager_thread = loader.worker_manager_thread
-        for i, sample in enumerate(loader):
-            if i == 3:
-                break
-        del loader
-        for w in workers:
-            w.join(JOIN_TIMEOUT)
-            self.assertFalse(w.is_alive(), 'subprocess not terminated')
-            self.assertEqual(w.exitcode, 0)
-        worker_manager_thread.join(JOIN_TIMEOUT)
-        self.assertFalse(worker_manager_thread.is_alive())
-
-    @staticmethod
-    def _manager_process(dataset, worker_pids, manager_exit_event):
-        loader = iter(DataLoader(dataset, batch_size=2, num_workers=4, pin_memory=True))
-        workers = loader.workers
-        for i in range(len(workers)):
-            worker_pids[i] = int(workers[i].pid)
-        for i, sample in enumerate(loader):
-            if i == 3:
-                break
-        # Simulate a dirty exit of the manager process
-        manager_exit_event.set()
-        if IS_WINDOWS:
-            os.system('taskkill /PID ' + str(os.getpid()) + ' /F')
+        r"""Check that workers exit even if the iterator is not exhausted."""
+        if TEST_CUDA:
+            pin_memory_configs = (True, False)
         else:
-            os.kill(os.getpid(), signal.SIGKILL)
+            pin_memory_configs = (False,)
 
-    @staticmethod
-    def _is_process_alive(pid, pname):
-        # There is a chance of a terminated child process's pid being reused by a new unrelated process,
-        # but since we are looping this check very frequently, we will know that the child process dies
-        # before the new unrelated process starts.
-        if IS_WINDOWS:
-            command = 'tasklist | find "{}" /i'.format(pid)
-        else:
-            command = 'ps -p {} -o comm='.format(pid)
-        p = subprocess.Popen(command, stdout=subprocess.PIPE, shell=True)
-        (output, err) = p.communicate()
-        p_status = p.wait()
-        output = output.decode('utf-8')
-        return pname in output
+        for pin_memory in pin_memory_configs:
+            loader = iter(DataLoader(self.dataset, batch_size=2, num_workers=4, pin_memory=pin_memory))
+            workers = loader.workers
+            if pin_memory:
+                pin_memory_thread = loader.pin_memory_thread
+            for i, sample in enumerate(loader):
+                if i == 10:
+                    break
+            assert i == 10
+            del loader
+            for w in workers:
+                w.join(JOIN_TIMEOUT)
+                self.assertFalse(w.is_alive(), 'subprocess not terminated')
+            if pin_memory:
+                pin_memory_thread.join(JOIN_TIMEOUT)
+                self.assertFalse(pin_memory_thread.is_alive())
 
-    @unittest.skipIf(sys.version_info[0] == 2,
-                     "spawn start method is not supported in Python 2, \
-                     but we need it for creating another process with CUDA")
-    @unittest.skipIf(not TEST_CUDA, "CUDA unavailable")
-    def test_manager_unclean_exit(self):
-        '''there might be ConnectionResetError or leaked semaphore warning (due to dirty process exit), \
-but they are all safe to ignore'''
-        worker_pids = multiprocessing.Array('i', [0] * 4)
+    @skipIfRocm
+    @unittest.skipIf(not HAS_PSUTIL, "psutil not found")
+    def test_proper_exit(self):
+        (r'''There might be ConnectionResetError or leaked semaphore warning '''
+         r'''(due to dirty process exit), but they are all safe to ignore''')
 
-        manager_exit_event = multiprocessing.Event()
-        mp = multiprocessing.Process(target=TestDataLoader._manager_process,
-                                     args=(self.dataset, worker_pids, manager_exit_event))
-        mp.start()
+        # TODO: test the case where the pin_memory_thread triggers an
+        #       error/fatal signal. I haven't found out how to properly do that.
 
-        manager_exit_event.wait()
+        for use_workers, pin_memory, hold_iter_reference in itertools.product([True, False], repeat=3):
+            # `hold_iter_reference` specifies whether we hold a reference to the
+            # iterator. This is interesting because Python3 error traces holds a
+            # reference to the frames, which hold references to all the local
+            # variables including the iterator, and then the iterator dtor may
+            # not be called before process end. It is important to see that the
+            # processes still exit in both cases.
 
-        exit_status = [False] * len(worker_pids)
-        start_time = time.time()
-        pname = 'python'
-        while True:
-            for i in range(len(worker_pids)):
-                pid = worker_pids[i]
-                if not exit_status[i]:
-                    if not TestDataLoader._is_process_alive(pid, pname):
-                        exit_status[i] = True
-            if all(exit_status):
-                break
+            if pin_memory and (not TEST_CUDA or NO_MULTIPROCESSING_SPAWN):
+                # Can't use CUDA without spawn
+                continue
+
+            # `exit_method` controls the way the loader process ends.
+            #   - `*_kill` means that `*` is killed by OS.
+            #   - `*_error` means that `*` raises an error.
+            #   - `None` means that no error happens.
+            # In all cases, all processes should end properly.
+            if use_workers:
+                exit_methods = [None, 'loader_error', 'loader_kill', 'worker_kill', 'worker_error']
             else:
-                time.sleep(1)
-                self.assertFalse(time.time() - start_time > MANAGER_STATUS_CHECK_INTERVAL + JOIN_TIMEOUT,
-                                 'subprocess not terminated')
+                exit_methods = [None, 'loader_error', 'loader_kill']
+
+            for exit_method in exit_methods:
+
+                desc = []
+                desc.append('use_workers={}'.format(use_workers))
+                desc.append('pin_memory={}'.format(pin_memory))
+                desc.append('hold_iter_reference={}'.format(hold_iter_reference))
+                desc.append('exit_method={}'.format(exit_method))
+                desc = 'test_proper_exit with ' + ', '.join(desc)
+
+                # Event that the loader process uses to signal testing process
+                # that various things are setup, including that the worker pids
+                # are specified in `worker_pids` array.
+                loader_setup_event = mp.Event()
+
+                # Event that this process has finished setting up, and the
+                # loader process can now proceed to trigger error events or
+                # finish normally.
+                tester_setup_event = mp.Event()
+
+                loader_p = ErrorTrackingProcess(target=_test_proper_exit,
+                                                args=(use_workers, pin_memory, exit_method,
+                                                      hold_iter_reference, loader_setup_event,
+                                                      tester_setup_event))
+                loader_p.start()
+
+                # Wait for loader process to set everything up, e.g., starting
+                # workers.
+                loader_setup_event.wait(timeout=JOIN_TIMEOUT)
+                if not loader_setup_event.is_set():
+                    fail_msg = desc + ': loader process failed to setup with given time'
+                    if loader_p.exception is not None:
+                        self.fail(fail_msg + ', and had exception {}'.format(loader_p.exception))
+                    elif not loader_p.is_alive():
+                        self.fail(fail_msg + ', and exited with code {} but no exception'.format(loader_p.exitcode))
+                    else:
+                        self.fail(fail_msg + ', and is still alive.')
+
+                worker_psutil_p = psutil.Process(loader_p.pid).children()
+
+                tester_setup_event.set()
+
+                try:
+                    loader_p.join(JOIN_TIMEOUT + MP_STATUS_CHECK_INTERVAL)
+                    self.assertFalse(loader_p.is_alive(), desc + ': loader process not terminated')
+                    _, alive = psutil.wait_procs(worker_psutil_p, timeout=(MP_STATUS_CHECK_INTERVAL + JOIN_TIMEOUT))
+                    if len(alive) > 0:
+                        self.fail(desc + ': worker process (pid(s) {}) not terminated'.format(
+                            ', '.join(str(p.pid) for p in alive)))
+                    if exit_method is None:
+                        self.assertEqual(loader_p.exitcode, 0)
+                    else:
+                        self.assertNotEqual(loader_p.exitcode, 0)
+                        if exit_method == 'loader_error':
+                            self.assertIsInstance(loader_p.exception, RuntimeError, desc)
+                            self.assertIn('Loader error', str(loader_p.exception), desc)
+                        elif exit_method == 'worker_kill':
+                            self.assertIsInstance(loader_p.exception, RuntimeError, desc)
+                            self.assertIn('DataLoader worker (pid', str(loader_p.exception), desc)
+                        elif exit_method == 'worker_error':
+                            self.assertIsInstance(loader_p.exception, RuntimeError, desc)
+                            self.assertIn('Worker error', str(loader_p.exception), desc)
+                finally:
+                    loader_p.terminate()
 
     def test_len(self):
         def check_len(dl, expected):
@@ -604,22 +831,61 @@ but they are all safe to ignore'''
             batch = next(iter(loader))
             self.assertIsInstance(batch, tt)
 
+    def test_default_collate_dtype(self):
+        arr = [1, 2, -1]
+        collated = _utils.collate.default_collate(arr)
+        self.assertEqual(collated, torch.tensor(arr))
+        self.assertEqual(collated.dtype, torch.int64)
+
+        arr = [1.1, 2.3, -0.9]
+        collated = _utils.collate.default_collate(arr)
+        self.assertEqual(collated, torch.tensor(arr))
+        self.assertEqual(collated.dtype, torch.float64)
+
+        arr = [True, False]
+        collated = _utils.collate.default_collate(arr)
+        self.assertEqual(collated, torch.tensor(arr))
+        self.assertEqual(collated.dtype, torch.uint8)
+
+        # Should be a no-op
+        arr = ['a', 'b', 'c']
+        self.assertEqual(arr, _utils.collate.default_collate(arr))
+
     @unittest.skipIf(not TEST_NUMPY, "numpy unavailable")
-    def test_default_colate_bad_numpy_types(self):
+    def test_default_collate_bad_numpy_types(self):
         import numpy as np
 
         # Should be a no-op
         arr = np.array(['a', 'b', 'c'])
-        default_collate(arr)
+        self.assertEqual(arr, _utils.collate.default_collate(arr))
 
         arr = np.array([[['a', 'b', 'c']]])
-        self.assertRaises(TypeError, lambda: default_collate(arr))
+        self.assertRaises(TypeError, lambda: _utils.collate.default_collate(arr))
 
         arr = np.array([object(), object(), object()])
-        self.assertRaises(TypeError, lambda: default_collate(arr))
+        self.assertRaises(TypeError, lambda: _utils.collate.default_collate(arr))
 
         arr = np.array([[[object(), object(), object()]]])
-        self.assertRaises(TypeError, lambda: default_collate(arr))
+        self.assertRaises(TypeError, lambda: _utils.collate.default_collate(arr))
+
+    @unittest.skipIf(not TEST_NUMPY, "numpy unavailable")
+    def test_default_collate_shared_tensor(self):
+        import numpy as np
+        t_in = torch.zeros(1)
+        n_in = np.zeros(1)
+
+        self.assertEqual(t_in.is_shared(), False)
+
+        self.assertEqual(_utils.collate.default_collate([t_in]).is_shared(), False)
+        self.assertEqual(_utils.collate.default_collate([n_in]).is_shared(), False)
+
+        old = _utils.collate._use_shared_memory
+        try:
+            _utils.collate._use_shared_memory = True
+            self.assertEqual(_utils.collate.default_collate([t_in]).is_shared(), True)
+            self.assertEqual(_utils.collate.default_collate([n_in]).is_shared(), True)
+        finally:
+            _utils.collate._use_shared_memory = old
 
 
 class StringDataset(Dataset):
@@ -637,8 +903,8 @@ class TestStringDataLoader(TestCase):
     def setUp(self):
         self.dataset = StringDataset()
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     @unittest.skipIf(not TEST_CUDA, "CUDA unavailable")
+    @skipIfRocm
     def test_shuffle_pin_memory(self):
         loader = DataLoader(self.dataset, batch_size=2, shuffle=True, num_workers=4, pin_memory=True)
         for batch_ndx, (s, n) in enumerate(loader):
@@ -682,6 +948,7 @@ class TestDictDataLoader(TestCase):
             self.assertEqual(n[1], idx + 1)
 
     @unittest.skipIf(not TEST_CUDA, "CUDA unavailable")
+    @skipIfRocm
     def test_pin_memory(self):
         loader = DataLoader(self.dataset, batch_size=2, pin_memory=True)
         for batch_ndx, sample in enumerate(loader):
@@ -721,7 +988,6 @@ class TestIndividualWorkerQueue(TestCase):
             if current_worker_idx == num_workers:
                 current_worker_idx = 0
 
-    @unittest.skipIf(IS_WINDOWS, "FIXME: Intermittent CUDA out-of-memory error")
     def test_ind_worker_queue(self):
         for batch_size in (8, 16, 32, 64):
             for num_workers in range(1, 6):

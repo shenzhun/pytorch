@@ -51,7 +51,7 @@ __global__ void InstanceNormInvStdevKernel(
     }
     inv_stdev_data[i] /= dim;
     inv_stdev_data[i] += epsilon;
-    inv_stdev_data[i] = 1.0 / std::sqrt(inv_stdev_data[i]);
+    inv_stdev_data[i] = 1.0 / sqrtf(inv_stdev_data[i]);
   }
 }
 
@@ -187,7 +187,7 @@ bool InstanceNormOp<float, CUDAContext>::RunOnDeviceWithOrderNHWC() {
   const auto& input = Input(INPUT);
   const auto& scale = Input(SCALE);
   const auto& bias = Input(BIAS);
-  auto output = Output(OUTPUT);
+
   auto mean = OutputSize() >= 2 ? Output(MEAN) : &mean_;
   auto inv_stdev = OutputSize() >= 3 ? Output(INV_STDEV) : &inv_stdev_;
   CAFFE_ENFORCE_EQ(4, input.ndim());
@@ -199,16 +199,16 @@ bool InstanceNormOp<float, CUDAContext>::RunOnDeviceWithOrderNHWC() {
   CAFFE_ENFORCE_EQ(C, scale.dim32(0));
   CAFFE_ENFORCE_EQ(1, bias.ndim());
   CAFFE_ENFORCE_EQ(C, bias.dim32(0));
-  output->ResizeLike(input);
+  auto output = Output(OUTPUT, input.sizes(), at::dtype<float>());
   mean->Resize(N, C);
   inv_stdev->Resize(N, C);
 
   const auto input_data = input.data<float>();
   const auto scale_data = scale.data<float>();
   const auto bias_data = bias.data<float>();
-  auto output_data = output->mutable_data<float>();
-  auto mean_data = mean->mutable_data<float>();
-  auto inv_stdev_data = inv_stdev->mutable_data<float>();
+  auto output_data = output->template mutable_data<float>();
+  auto mean_data = mean->template mutable_data<float>();
+  auto inv_stdev_data = inv_stdev->template mutable_data<float>();
 
   const auto dim = H * W;
   const auto N_stride = C * H * W;
@@ -264,7 +264,7 @@ bool InstanceNormOp<float, CUDAContext>::RunOnDeviceWithOrderNCHW() {
   const auto& input = Input(INPUT);
   const auto& scale = Input(SCALE);
   const auto& bias = Input(BIAS);
-  auto output = Output(OUTPUT);
+
   auto mean = OutputSize() >= 2 ? Output(MEAN) : &mean_;
   auto inv_stdev = OutputSize() >= 3 ? Output(INV_STDEV) : &inv_stdev_;
   CAFFE_ENFORCE_EQ(4, input.ndim());
@@ -276,16 +276,16 @@ bool InstanceNormOp<float, CUDAContext>::RunOnDeviceWithOrderNCHW() {
   CAFFE_ENFORCE_EQ(C, scale.dim32(0));
   CAFFE_ENFORCE_EQ(1, bias.ndim());
   CAFFE_ENFORCE_EQ(C, bias.dim32(0));
-  output->ResizeLike(input);
+  auto output = Output(OUTPUT, input.sizes(), at::dtype<float>());
   mean->Resize(N, C);
   inv_stdev->Resize(N, C);
 
   const auto input_data = input.data<float>();
   const auto scale_data = scale.data<float>();
   const auto bias_data = bias.data<float>();
-  auto output_data = output->mutable_data<float>();
-  auto mean_data = mean->mutable_data<float>();
-  auto inv_stdev_data = inv_stdev->mutable_data<float>();
+  auto output_data = output->template mutable_data<float>();
+  auto mean_data = mean->template mutable_data<float>();
+  auto inv_stdev_data = inv_stdev->template mutable_data<float>();
 
   const auto dim = H * W;
   const auto N_stride = C * H * W;
@@ -344,9 +344,7 @@ bool InstanceNormGradientOp<float, CUDAContext>::RunOnDeviceWithOrderNHWC() {
   const auto& output_grad = Input(OUTPUT_GRAD);
   const auto& mean = InputSize() >= 5 ? Input(MEAN) : mean_;
   const auto& inv_stdev = InputSize() >= 6 ? Input(INV_STDEV) : inv_stdev_;
-  auto input_grad = Output(INPUT_GRAD);
-  auto scale_grad = Output(SCALE_GRAD);
-  auto bias_grad = Output(BIAS_GRAD);
+
   CAFFE_ENFORCE_EQ(4, input.ndim());
   const int N = input.dim32(0);
   const int H = input.dim32(1);
@@ -361,18 +359,18 @@ bool InstanceNormGradientOp<float, CUDAContext>::RunOnDeviceWithOrderNHWC() {
   CAFFE_ENFORCE_EQ(H, output_grad.dim32(1));
   CAFFE_ENFORCE_EQ(W, output_grad.dim32(2));
   CAFFE_ENFORCE_EQ(C, output_grad.dim32(3));
-  input_grad->ResizeLike(input);
-  scale_grad->ResizeLike(scale);
-  bias_grad->ResizeLike(bias);
+  auto input_grad = Output(INPUT_GRAD, input.sizes(), at::dtype<float>());
+  auto scale_grad = Output(SCALE_GRAD, scale.sizes(), at::dtype<float>());
+  auto bias_grad = Output(BIAS_GRAD, bias.sizes(), at::dtype<float>());
 
   const auto input_data = input.data<float>();
   const auto scale_data = scale.data<float>();
   const auto bias_data = bias.data<float>();
   const auto output_grad_data = output_grad.data<float>();
 
-  auto input_grad_data = input_grad->mutable_data<float>();
-  auto scale_grad_data = scale_grad->mutable_data<float>();
-  auto bias_grad_data = bias_grad->mutable_data<float>();
+  auto input_grad_data = input_grad->template mutable_data<float>();
+  auto scale_grad_data = scale_grad->template mutable_data<float>();
+  auto bias_grad_data = bias_grad->template mutable_data<float>();
 
   const auto dim = H * W;
   const auto N_stride = C * H * W;
@@ -380,7 +378,7 @@ bool InstanceNormGradientOp<float, CUDAContext>::RunOnDeviceWithOrderNHWC() {
   const auto dim_stride = C;
 
   if (InputSize() < 5) {
-    mean_.Resize(N, C);
+    ReinitializeTensor(&mean_, {N, C}, at::dtype<float>().device(CUDA));
     auto mean_mutable_data = mean_.mutable_data<float>();
     InstanceNormMeanKernel<<<
         CAFFE_GET_BLOCKS(N * C),
@@ -403,7 +401,7 @@ bool InstanceNormGradientOp<float, CUDAContext>::RunOnDeviceWithOrderNHWC() {
   const auto mean_data = mean.data<float>();
 
   if (InputSize() < 6) {
-    inv_stdev_.Resize(N, C);
+    ReinitializeTensor(&inv_stdev_, {N, C}, at::dtype<float>().device(CUDA));
     auto inv_stdev_mutable_data = inv_stdev_.mutable_data<float>();
     InstanceNormInvStdevKernel<<<
         CAFFE_GET_BLOCKS(N * C),
@@ -475,9 +473,7 @@ bool InstanceNormGradientOp<float, CUDAContext>::RunOnDeviceWithOrderNCHW() {
   const auto& output_grad = Input(OUTPUT_GRAD);
   const auto& mean = InputSize() >= 5 ? Input(MEAN) : mean_;
   const auto& inv_stdev = InputSize() >= 6 ? Input(INV_STDEV) : inv_stdev_;
-  auto input_grad = Output(INPUT_GRAD);
-  auto scale_grad = Output(SCALE_GRAD);
-  auto bias_grad = Output(BIAS_GRAD);
+
   CAFFE_ENFORCE_EQ(4, input.ndim());
   const int N = input.dim32(0);
   const int C = input.dim32(1);
@@ -492,18 +488,18 @@ bool InstanceNormGradientOp<float, CUDAContext>::RunOnDeviceWithOrderNCHW() {
   CAFFE_ENFORCE_EQ(C, output_grad.dim32(1));
   CAFFE_ENFORCE_EQ(H, output_grad.dim32(2));
   CAFFE_ENFORCE_EQ(W, output_grad.dim32(3));
-  input_grad->ResizeLike(input);
-  scale_grad->ResizeLike(scale);
-  bias_grad->ResizeLike(bias);
+  auto input_grad = Output(INPUT_GRAD, input.sizes(), at::dtype<float>());
+  auto scale_grad = Output(SCALE_GRAD, scale.sizes(), at::dtype<float>());
+  auto bias_grad = Output(BIAS_GRAD, bias.sizes(), at::dtype<float>());
 
   const auto input_data = input.data<float>();
   const auto scale_data = scale.data<float>();
   const auto bias_data = bias.data<float>();
   const auto output_grad_data = output_grad.data<float>();
 
-  auto input_grad_data = input_grad->mutable_data<float>();
-  auto scale_grad_data = scale_grad->mutable_data<float>();
-  auto bias_grad_data = bias_grad->mutable_data<float>();
+  auto input_grad_data = input_grad->template mutable_data<float>();
+  auto scale_grad_data = scale_grad->template mutable_data<float>();
+  auto bias_grad_data = bias_grad->template mutable_data<float>();
 
   const auto dim = H * W;
   const auto N_stride = C * H * W;

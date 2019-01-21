@@ -147,8 +147,8 @@ bool SoftmaxFocalLossOp<float, CUDAContext>::RunOnDevice() {
   auto& X = Input(0);         // Logits
   auto& T = Input(1);         // Labels
   auto& wp = Input(2);        // num of foregound
-  auto* avg_loss = Output(0); // average loss as output
-  auto* P = Output(1);        // softmax probability, going to be re-used in gradient
+   // average loss as output
+          // softmax probability, going to be re-used in gradient
 
   int N = X.dim32(0);
   int D = X.dim32(1);
@@ -156,9 +156,9 @@ bool SoftmaxFocalLossOp<float, CUDAContext>::RunOnDevice() {
   int W = X.dim32(3);
   int A = D / num_classes_;
 
-  losses_.Resize(N * A * H * W);
-  P->Resize(N * D * H * W);
-  avg_loss->Resize(vector<TIndex>());
+  ReinitializeTensor(&losses_, {N * A * H * W}, at::dtype<float>().device(CUDA));
+  auto* P = Output(1, {N * D * H * W}, at::dtype<float>());
+  auto* avg_loss = Output(0, vector<int64_t>(), at::dtype<float>());
   math::Set<float, CUDAContext>(
       avg_loss->size(), 0.f, avg_loss->mutable_data<float>(), &context_);
   math::Set<float, CUDAContext>(
@@ -189,7 +189,7 @@ bool SoftmaxFocalLossOp<float, CUDAContext>::RunOnDevice() {
   float* avg_loss_data = avg_loss->mutable_data<float>();
   math::Sum<float, CUDAContext>(
       losses_.size(), losses_.data<float>(), avg_loss_data, &context_);
-  math::Scale<float, CUDAContext>(
+  math::Scale<float, float, CUDAContext>(
       1, scale_, avg_loss_data, avg_loss_data, &context_);
 
   return true;
@@ -203,7 +203,6 @@ bool SoftmaxFocalLossGradientOp<float, CUDAContext>::RunOnDevice() {
   auto& wp = Input(2);   // num of foreground example
   auto& P = Input(3);    // Softmax Probability
   auto& d_avg_loss = Input(4);
-  auto* dX = Output(0);  // gradient wrt logits
 
 
   int N = X.dim32(0);
@@ -212,9 +211,9 @@ bool SoftmaxFocalLossGradientOp<float, CUDAContext>::RunOnDevice() {
   int W = X.dim32(3);
   int A = D / num_classes_;
 
-  buff_.Resize(N * A * H * W);
+  ReinitializeTensor(&buff_, {N * A * H * W}, at::dtype<float>().device(CUDA));
 
-  dX->ResizeLike(X);
+  auto* dX = Output(0, X.sizes(), at::dtype<float>()); // gradient wrt logits
 
   const float* Xdata = X.data<float>();
   const int* Tdata = T.data<int>();
@@ -235,9 +234,12 @@ bool SoftmaxFocalLossGradientOp<float, CUDAContext>::RunOnDevice() {
          0, context_.cuda_stream()>>>(
     N, D, H, W, Pdata, Tdata, Bdata, d_avg_loss.data<float>(),
     dX->mutable_data<float>(), num_classes_);
-  math::Scale<float, CUDAContext>(
-    dX->size(), scale_, dX->data<float>(), dX->mutable_data<float>(),
-    &context_);
+  math::Scale<float, float, CUDAContext>(
+      dX->size(),
+      scale_,
+      dX->data<float>(),
+      dX->mutable_data<float>(),
+      &context_);
   return true;
 }
 

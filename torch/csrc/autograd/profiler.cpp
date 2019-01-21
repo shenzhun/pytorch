@@ -1,61 +1,146 @@
-#include "torch/csrc/autograd/profiler.h"
-#include "torch/csrc/autograd/function.h"
+#include <torch/csrc/autograd/profiler.h>
+#include <torch/csrc/autograd/function.h>
+
+#include <sstream>
 
 namespace torch { namespace autograd { namespace profiler {
 
+CUDAStubs default_stubs;
+constexpr CUDAStubs* default_stubs_addr = &default_stubs;
+// constant initialization, so it is guarenteed to be initialized before
+// static initialization calls which may invoke registerCUDAMethods
+static CUDAStubs* cuda_stubs = default_stubs_addr;
+
+TORCH_API void registerCUDAMethods(CUDAStubs* stubs) {
+  cuda_stubs = stubs;
+}
+
 ProfilerState state = ProfilerState::Disabled;
-uint32_t next_thread_id = 0;
+uint16_t next_thread_id = 0;
 std::mutex all_event_lists_mutex;
 std::list<std::shared_ptr<RangeEventList>> all_event_lists;
 thread_local std::shared_ptr<RangeEventList> event_list;
-thread_local int32_t thread_id;
+thread_local uint16_t thread_id;
 
-void RecordFunction::pushFunctionRange(Function* fn) {
-  pushRange(fn->name());
+RangeEventList& getEventList() {
+  if (!event_list) {
+    std::lock_guard<std::mutex> guard(all_event_lists_mutex);
+    event_list = std::make_shared<RangeEventList>();
+    thread_id = next_thread_id++;
+    all_event_lists.emplace_front(event_list);
+  }
+  return *event_list;
 }
 
-#ifdef WITH_CUDA
-static void onEachDevice(std::function<void(int)> op) {
-  AutoGPU gpu_guard;
-  int count;
-  TORCH_CUDA_CHECK(cudaGetDeviceCount(&count));
-  for(int i = 0; i < count; i++) {
-    gpu_guard.setDevice(i);
-    op(i);
+void mark(std::string name, bool include_cuda /* = true */) {
+  if (state == ProfilerState::Disabled) {
+    return;
+  }
+  if (state == ProfilerState::NVTX) {
+    cuda_stubs->nvtxMarkA(name.c_str());
+  } else {
+    getEventList().record(
+        EventKind::Mark,
+        std::move(name),
+        thread_id,
+        include_cuda && state == ProfilerState::CUDA);
   }
 }
-#endif
+
+const char* c_str(const char *str) { return str; }
+// NB: non-const to disallow temporaries (lifetime issues)
+const char* c_str(std::string& str) { return str.c_str(); }
+
+template<typename T>
+void pushRangeImpl(T name, const char* msg="", int64_t sequence_nr=-1) {
+  if (state == ProfilerState::Disabled) {
+    return;
+  }
+  if (state == ProfilerState::NVTX) {
+    if(sequence_nr >= 0) {
+      std::stringstream s;
+      s << name << msg << sequence_nr;
+      cuda_stubs->nvtxRangePushA(s.str().c_str());
+    } else {
+      cuda_stubs->nvtxRangePushA(c_str(name));
+    }
+  } else {
+    getEventList().record(
+        EventKind::PushRange,
+        std::move(name),
+        thread_id,
+        state == ProfilerState::CUDA);
+  }
+}
+
+void pushRange(std::string name) {
+  pushRangeImpl(std::move(name));
+}
+
+void popRange() {
+  if (state == ProfilerState::Disabled) {
+    return;
+  }
+  if (state == ProfilerState::NVTX) {
+    cuda_stubs->nvtxRangePop();
+  } else {
+    getEventList().record(
+        EventKind::PopRange,
+        "",
+        thread_id,
+        state == ProfilerState::CUDA);
+  }
+}
+
+RecordFunction::RecordFunction(Function* fn) {
+  // typeid(*fn).name() would avoid an additional string allocation.
+  // However, typeid(*fn).name() would cause nvtx annotations for all user-defined
+  // (Python-side) custom autograd function backward() methods to have the same name,
+  // because they route through the same C++ side class.
+  // fn->name() ensures that nvtx annotations for custom function backward() methods
+  // receive a relevant, demangled name.
+  pushRangeImpl(fn->name(), ", stashed seq=", fn->sequence_nr());
+}
+
+RecordFunction::RecordFunction(std::string name) {
+  pushRangeImpl(std::move(name));
+}
+
+RecordFunction::RecordFunction(const char* name) {
+  pushRangeImpl<const char*>(name);
+}
+
+RecordFunction::RecordFunction(const char* name, int64_t current_sequence_nr)
+{
+  pushRangeImpl<const char*>(name, ", seq=", current_sequence_nr);
+}
 
 void enableProfiler(ProfilerState new_state) {
-  TORCH_ASSERT(new_state != ProfilerState::Disabled);
-#ifndef WITH_CUDA
-  if (new_state == ProfilerState::NVTX)
+  AT_ASSERT(new_state != ProfilerState::Disabled);
+  if (new_state == ProfilerState::NVTX && !cuda_stubs->enabled())
     throw std::runtime_error("Can't use NVTX profiler - PyTorch was compiled without CUDA");
-#endif
   if (state != ProfilerState::Disabled && new_state != state) {
       throw std::runtime_error("can't change kind of profiling (e.g. NVTX to CPU) while profiler is running");
   }
   state = new_state;
 
-#ifdef WITH_CUDA
   if(state == ProfilerState::CUDA) {
     // event recording appears to have some startup overhead, so we need to
     // to generate some dummy events first before recording syncrhonization events
     for(int i = 0; i < 5; i++) {
-      onEachDevice([](int d) {
+      cuda_stubs->onEachDevice([](int d) {
           mark("__cuda_startup");
-          cudaDeviceSynchronize();
+          cuda_stubs->synchronize();
       });
     }
 
     // cuda events must be on the same device, so we need a start event recorded
     // for each gpu. we then use this event to synchronize time on the GPU
     // with the CPU clock.
-    onEachDevice([](int d) {
+    cuda_stubs->onEachDevice([](int d) {
         mark("__cuda_start_event");
     });
   }
-#endif
   mark("__start_profile", false);
 }
 
@@ -86,5 +171,25 @@ thread_event_lists disableProfiler() {
     return result;
   }
 }
+
+void Event::record(bool record_cuda) {
+  if (record_cuda) {
+    cuda_stubs->record(&device_, &event, &cpu_ns_);
+    return;
+  }
+  cpu_ns_ = getTime();
+}
+
+double Event::cuda_elapsed_us(const Event & e) {
+  if(!e.has_cuda() || !has_cuda()) {
+    throw std::logic_error("Events were not recorded for CUDA");
+  }
+  if(e.device() != device()) {
+    throw std::logic_error("Events are not on the same device");
+  }
+  return cuda_stubs->elapsed(event, e.event);
+}
+
+CUDAStubs::~CUDAStubs() = default;
 
 }}}

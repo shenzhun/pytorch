@@ -27,7 +27,7 @@ __global__ void FillValuesKernel(
     const size_t itemSize,
     const int* indices,
     char* const values[],
-    int valueSizes[],
+    int* valueSizes,
     char* dest) {
   CUDA_1D_KERNEL_LOOP(j, numMasks) {
     int k = 0;
@@ -60,11 +60,13 @@ class BooleanUnmaskOp<CUDAContext> final : public Operator<CUDAContext> {
     out->Resize(maskSize);
     auto* dest = (char*)out->raw_mutable_data(meta);
 
-    hostMasks_.Resize(numMasks);
+    ReinitializeTensor(&hostMasks_, {numMasks}, at::dtype<bool*>().device(CPU));
     auto* hostMasksData = hostMasks_.mutable_data<bool*>();
-    hostValues_.Resize(numMasks);
+    ReinitializeTensor(
+        &hostValues_, {numMasks}, at::dtype<char*>().device(CPU));
     auto* hostValuesData = hostValues_.mutable_data<char*>();
-    hostValueSizes_.Resize(numMasks);
+    ReinitializeTensor(
+        &hostValueSizes_, {numMasks}, at::dtype<int>().device(CPU));
     auto* hostValueSizesData = hostValueSizes_.mutable_data<int>();
     for (int i = 0; i < numMasks; ++i) {
       auto& mask = Input(i * 2);
@@ -77,11 +79,11 @@ class BooleanUnmaskOp<CUDAContext> final : public Operator<CUDAContext> {
       hostValuesData[i] = (char*)value.raw_data();
       hostValueSizesData[i] = value.size();
     }
-    masks_.CopyFrom(hostMasks_, &context_);
-    values_.CopyFrom(hostValues_, &context_);
-    valueSizes_.CopyFrom(hostValueSizes_, &context_);
+    masks_.CopyFrom(hostMasks_);
+    values_.CopyFrom(hostValues_);
+    valueSizes_.CopyFrom(hostValueSizes_);
 
-    indices_.Resize(maskSize);
+    ReinitializeTensor(&indices_, {maskSize}, at::dtype<int>().device(CUDA));
     auto* indicesData = indices_.mutable_data<int>();
 
     ComputeIndicesKernel<<<
@@ -109,14 +111,14 @@ class BooleanUnmaskOp<CUDAContext> final : public Operator<CUDAContext> {
   }
 
  private:
-  Tensor<CUDAContext> indices_;
-  Tensor<CUDAContext> masks_;
-  Tensor<CUDAContext> values_;
-  Tensor<CUDAContext> valueSizes_;
+  Tensor indices_;
+  Tensor masks_{CUDA};
+  Tensor values_{CUDA};
+  Tensor valueSizes_{CUDA};
 
-  Tensor<CPUContext> hostMasks_;
-  Tensor<CPUContext> hostValues_;
-  Tensor<CPUContext> hostValueSizes_;
+  Tensor hostMasks_;
+  Tensor hostValues_;
+  Tensor hostValueSizes_;
 };
 
 REGISTER_CUDA_OPERATOR(BooleanUnmask, BooleanUnmaskOp<CUDAContext>);
